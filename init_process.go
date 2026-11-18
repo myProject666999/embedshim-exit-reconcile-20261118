@@ -288,6 +288,15 @@ func (p *initProcess) SetExited(status int) {
 func (p *initProcess) setExited(status int) {
 	p.exited = time.Now()
 	p.status = unix.WaitStatus(status).ExitStatus()
+
+	// Publish the exit through the ordered outlet before anything tears the
+	// cgroup down. The outlet performs a synchronous memory counter read
+	// here, so a kill that the asynchronous watch has not delivered yet is
+	// still published ahead of the exit. A nil parent (rollback paths) and a
+	// nil outlet (before Create) are both fine: the call is a no-op.
+	if p.parent != nil {
+		p.parent.publishExit(p.status, p.exited)
+	}
 	if p.platform != nil {
 		p.platform.ShutdownConsole(context.Background(), p.console)
 

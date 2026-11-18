@@ -107,7 +107,24 @@ func (manager *TaskManager) loadShim(ctx context.Context, bundle *pkgbundle.Bund
 	if err := manager.repollingInitProcess(init); err != nil {
 		return nil, err
 	}
-	return renewShim(manager, init), nil
+
+	sh := renewShim(manager, init)
+
+	// Re-attach the memory event outlet for every reloaded task. Attaching
+	// re-reads the counters and compares them with the persisted baseline,
+	// so growth that happened while the shim was down is not reported as a
+	// new event.
+	//
+	// A task found stopped already had its exit published by the previous
+	// run (or by the exit trace before the restart): its outlet starts with
+	// the exit marked as published so no duplicate exit is emitted, while
+	// the delete that still has to happen remains possible.
+	exitReported := true
+	if st, err := init.Status(ctx); err == nil && (st == "running" || st == "paused") {
+		exitReported = false
+	}
+	sh.mem = newMemoryEventsWithOptions(ctx, init.bundle, init.Pid(), manager.events, exitReported)
+	return sh, nil
 }
 
 func renewShim(manager *TaskManager, init *initProcess) *shim {

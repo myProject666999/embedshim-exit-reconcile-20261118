@@ -33,6 +33,10 @@ type shim struct {
 	init *initProcess
 	cg   interface{}
 
+	// mem publishes memory, exit and delete events through one ordered
+	// outlet. It is nil only before the container process exists.
+	mem *memoryEvents
+
 	execProcesses   map[string]runtime.Process
 	reservedExecIDs map[string]struct{}
 }
@@ -83,6 +87,13 @@ func (s *shim) Create(ctx context.Context, opts runtime.CreateOpts) (_ runtime.T
 
 	defer func() {
 		if retErr != nil {
+			if s.mem != nil {
+				// Rollback must not publish a delete event: the task was
+				// never visible. Closing first also stops the watch before
+				// the cgroup goes away.
+				s.mem.close()
+			}
+
 			deferCtx, deferCancel := deferContext()
 			defer deferCancel()
 
@@ -94,6 +105,18 @@ func (s *shim) Create(ctx context.Context, opts runtime.CreateOpts) (_ runtime.T
 
 	if err := s.manager.traceInitProcess(s.init); err != nil {
 		return nil, err
+	}
+
+	// The memory event outlet is created after the process exists because
+	// the counter file is resolved from its cgroup. Attaching never fails:
+	// a missing or unreadable cgroup degrades the outlet and leaves a marker
+	// on the task instead of failing the container.
+	s.mem = newMemoryEvents(ctx, s.bundle, int(s.PID()), s.manager.events)
+	// The process can be killed before the outlet exists (for example while
+	// the exit trace is being attached). Publish the exit now so it is not
+	// lost; the outlet is idempotent.
+	if exitedAt := s.init.ExitedAt(); !exitedAt.IsZero() {
+		s.publishExit(s.init.ExitStatus(), exitedAt)
 	}
 
 	if pid := int(s.PID()); pid > 0 {
@@ -294,10 +317,26 @@ func (s *shim) State(ctx context.Context) (runtime.State, error) {
 }
 
 func (s *shim) Delete(ctx context.Context) (*runtime.Exit, error) {
+	// The final memory counter read must happen before the OCI runtime
+	// removes the cgroup (inside s.init.Delete). It publishes any memory
+	// event it reveals, but does not publish the delete yet: the deletion
+	// can still fail, and a delete event must not be published for a task
+	// that was not deleted.
+	s.mem.prepareDelete()
+
 	err := s.init.Delete(ctx)
 	if err != nil && !errors.Is(err, errdefs.ErrNotFound) {
 		return nil, err
 	}
+
+	// Delete is the last event. It is published only after the runtime
+	// deletion succeeded (or the cgroup was already absent). The outlet
+	// closes here, so a late memory notification is only logged.
+	//
+	// If the exit was never observed (a created task deleted directly), the
+	// delete is still the last event; no exit is invented, because
+	// fabricating one would corrupt the lifecycle counts consumers rely on.
+	s.mem.onDelete(s.init.Pid(), s.init.ExitStatus(), s.init.ExitedAt())
 
 	if err := s.bundle.Delete(); err != nil {
 		return nil, err
